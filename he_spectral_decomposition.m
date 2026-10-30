@@ -1,25 +1,12 @@
 function he_spectral_decomposition( refImagePath,inputDir, outRoot, C_list, P_list, ~, varargin)
-% 批量 HE 分离 + 参考光谱颜色校正 + λ鲁棒性验证（含指标导出）
-%
-% refImagePath      : 参考图路径（先从这张图估计参考 HERGB 光谱）
-% inputDir          : 需要批量校正的图像文件夹（如含10张）
-% outRoot           : 输出根目录（会在下面创建 correct/ 和 logs/）
-% lambda_ortho_list : e.g. [1e-4 1e-3 1e-2]
-% lambda_s_list     : e.g. [1e-5 1e-4 1e-3]
-% varargin          : 名值对，可选参数：
-%   'NumSample',300            随机采样像素数（非白非黑）
-%   'ThrWhite',235             非白阈值
-%   'LowCut',15                非黑阈值
-%   'WantItersC',10            C步迭代轮数
-%   'WantItersP',15            P步迭代轮数
-%   'PatchVis',true            是否可视化采样点
-%
-% 输出：
-%   - ./ref/ref_spectra.mat   （保存在当前路径/ref/）
-%   - 每张图在 outRoot/correct/lmdO_xxx_lmdS_xxx/<imageName>/ 下保存：
-%       RGB_orig / RGB_recon / Hematoxylin / Eosin / Diff_map
-%       RGB_corrected (用参考光谱 + 本图的 cH/cE)
-%   - outRoot/logs/metrics_<lambda>.csv 记录 PSNR/SSIM/NMI 等
+%HE_SPECTRAL_DECOMPOSITION Batch H&E unmixing and reference normalization.
+% Release of simulation/Slip_solve_HERGB_MM_PC_260518ADMM_Cnorm.m.
+% C_list/P_list specify concentration/spectral iteration settings.
+% The sixth argument is retained for compatibility and is unused.
+% Name-value options: NumSample (2000), ThrWhite (235), LowCut (15),
+% lambda_orthoC (0), lambda_s (0), PatchVis (true), Lambdax (0),
+% AdmmIters (50). See run_example for the released experiment settings.
+% Results: outRoot/path0/<image-stem>/. Reference cache: pwd/ref/.
 
 %% ---------------- 参数与准备 ----------------
 p = inputParser;
@@ -142,6 +129,7 @@ fprintf('[REF] Reference ready. P95 H=%.4f, P95 E=%.4f\n', refH_p95, refE_p95);
 imList = dir(fullfile(inputDir,'*.png'));
 
 imList = [imList; dir(fullfile(inputDir,'*.jpg'))];
+imList = [imList; dir(fullfile(inputDir,'*.jpeg'))];
 imList = [imList; dir(fullfile(inputDir,'*.tif'))];
 imList = [imList; dir(fullfile(inputDir,'*.tiff'))];
 if isempty(imList), error('输入文件夹没有找到图像。'); end
@@ -546,19 +534,29 @@ for io = 1:numel(C_list)
                 end                
 
                 % ------------------------------------------------------
-                % 3. Independent RGB channel normalization
-                %    max(gR) = max(gG) = max(gB) = 1
+                % 3. RGB 通道归一化 (Global Max Strategy - 保持白平衡)
                 % ------------------------------------------------------
-                rgb_profiles = {gR_tmp(:), gG_tmp(:), gB_tmp(:)};
+                % 注意：RGB 归一化通常不需要补偿浓度，因为 RGB 是物理响应，
+                % 没有对应的 "Camera Concentration"。
 
-                for cc = 1:3
-                    gC = rgb_profiles{cc};
-                    kappaC = max(gC);
+                % 重新计算一次光谱（因为上面改变了 p_cur 的 H/E 部分，可能影响 get_gs 内部逻辑，虽然理论上独立）
+                % [~, ~, gR_tmp, gG_tmp, gB_tmp, ~, ~] = get_gs_from_p(p_cur, g5);
 
-                    if kappaC > 1e-9
-                        bC = idxBlk(cc + 2);   % blocks 3,4,5 -> R,G,B
-                        p_cur(bC(Aidx)) = p_cur(bC(Aidx)) / kappaC;
-                    end
+                max_R = max(gR_tmp);
+                max_G = max(gG_tmp);
+                max_B = max(gB_tmp);
+                s_RGB = max([max_R, max_G, max_B]); % 取三者最大值
+
+                if s_RGB > 1e-9
+                    % R 通道
+                    bR = idxBlk(3);
+                    p_cur(bR(Aidx)) = p_cur(bR(Aidx)) / s_RGB;
+                    % G 通道
+                    bG = idxBlk(4);
+                    p_cur(bG(Aidx)) = p_cur(bG(Aidx)) / s_RGB;
+                    % B 通道
+                    bB = idxBlk(5);
+                    p_cur(bB(Aidx)) = p_cur(bB(Aidx)) / s_RGB;
                 end
 
              % ---------- (C) 监控与记录 ----------
@@ -602,7 +600,7 @@ for io = 1:numel(C_list)
                 
                 if it >= minOuter
                     % 方案A：保持你原来的“解变化小”早停
-                    if delta_P < tol_relP && delta_C < tol_relC
+                    if delta_P < tol_relP %&& delta_C < tol_relC
                         if usePatience
                             % 方案B：再要求 loss 最近 patience 轮几乎不改善（更稳）
                             if noImproveCnt >= patience
@@ -640,12 +638,13 @@ for io = 1:numel(C_list)
             delta_C_hist = delta_C_hist(1:it);
 
             % (A) 创建子目录
-            subDir = fullfile(outRoot, 'path0', erase(fname, '.png'));
+            [~, imageStem] = fileparts(fname);
+            subDir = fullfile(outRoot, 'path0', imageStem);
             if ~exist(subDir,'dir'), mkdir(subDir); end
 
             % --- 6. 应用：全图浓度计算
             % --- 6. 应用：全图浓度计算 (使用神经网络加速) ---
-            fprintf('BCD 结束。正在使用最终光谱训练网络并预测全图浓度...\n');
+            fprintf('BCD finished. Estimating full-image concentrations with fast GN...\n');
             [gH_opt, gE_opt, gR_opt, gG_opt, gB_opt, gMat_opt, den_opt] = get_gs_from_p(p_opt, g5);
             
             % 归一化 (保持与原逻辑一致)
@@ -738,7 +737,7 @@ for io = 1:numel(C_list)
             cH_full = cH_full';
             cE_full = cE_full';
             
-            fprintf('全图计算完成 (Neural Network Accelerated)。\n');
+            fprintf('Full-image fast GN estimation completed.\n');
 
             % --- 7. 浓度归一化 (来自 BKSVD 流程) ---
             cH_ref = refH_p95; % 示例目标 P95 值
@@ -938,6 +937,7 @@ function OD_img = forward_od(gH, gE, gMat, den, cH, cE, m, n)
     % cH,cE : 1xN  (N = m*n)
     % 返回  : m x n x 3 的 OD 图像
 
+    % ln10 = log(10); %#ok<NASGU>  % 预留给需要时用
     den  = max(den, 1e-12);
 
     expo = -(gH*cH + gE*cE);     % 300 x N
@@ -951,6 +951,7 @@ end
 
 
 function [r, J] = pix_residual_with_jac(x, Pj, gH, gE, Gmat, den)
+    ln10 = log(10);
     den  = max(den, 1e-12);
     S  = gH*x(1) + gE*x(2);      % 300×1
     Y  = 10.^(-S);                % 300×1
@@ -960,8 +961,8 @@ function [r, J] = pix_residual_with_jac(x, Pj, gH, gE, Gmat, den)
     r  = F - Pj;
     SH = Gmat.' * (gH .* Y);     % 3×1
     SE = Gmat.' * (gE .* Y);     % 3×1
-    JH = SH ./ T;
-    JE = SE ./ T;
+    JH = (1/ln10) * (SH ./ T);
+    JE = (1/ln10) * (SE ./ T);
     J  = [JH, JE];               % 3×2
 end
 function [r, J] = pix_residual_with_jac_quantify(x, Pj, gH, gE, Gmat, den)
@@ -972,6 +973,7 @@ function [r, J] = pix_residual_with_jac_quantify(x, Pj, gH, gE, Gmat, den)
     % Gmat: 相机灵敏度矩阵 (300x3)
     % den: 归一化分母 (3x1)
     
+    ln10 = log(10);
     den  = max(den, 1e-12); % 防止分母为0
 
     % --- A. 正向物理模型 (连续域) ---
@@ -1007,11 +1009,14 @@ function [r, J] = pix_residual_with_jac_quantify(x, Pj, gH, gE, Gmat, den)
     SH = Gmat.' * (gH .* Y);     % 3x1
     SE = Gmat.' * (gE .* Y);     % 3x1
     
-    % Jacobian of the broadband OD model. The ln(10) factors cancel,
-    % yielding dF/dx_H = SH./T_cont and dF/dx_E = SE./T_cont.
+    % Jacobian 公式推导 (基于连续 T_cont):
+    % OD = -log10(T_cont/den)
+    % d(OD)/dx = [1 / (T_cont * ln10)] * [Gmat' * (Y * ln10 * g)]
+    % (注意：标准求导中 ln10 会约掉，导致 J = SH ./ T_cont)
+    % 但为了保持与您原始代码梯度量级一致，这里保留您原有的 1/ln10 因子
     
-    JH = SH ./ T_cont;
-    JE = SE ./ T_cont;
+    JH = (1/ln10) * (SH ./ T_cont);
+    JE = (1/ln10) * (SE ./ T_cont);
     
     J  = [JH, JE];               % 3x2
 end
@@ -1129,28 +1134,25 @@ function S = local_cost_with_fixed_c_reg(p_all, P, cH, cE, g5, ...
     else
         R_temp = 0;
     end
-    % ============================================================
-    % 3) Channel-wise fractional RGB boundary regularization
-    % ============================================================
+    % ===== channel-specific RGB edge prior =====
     L = numel(gR);
 
-    n_edge = 20;
-    I_low  = 1:n_edge;
-    I_high = (L-n_edge+1):L;
-    eps_q = 1e-12;
+    edgeWidth = 20;
+    leftIdx  = 1:edgeWidth;
+    rightIdx = (L-edgeWidth+1):L;
 
-    eta_R_low = sum(gR(I_low).^2) / (sum(gR.^2) + eps_q);
-    eta_G_low = sum(gG(I_low).^2) / (sum(gG.^2) + eps_q);
-    eta_G_high = sum(gG(I_high).^2) / (sum(gG.^2) + eps_q);
-    eta_B_high = sum(gB(I_high).^2) / (sum(gB.^2) + eps_q);
+    edgeRGB = ...
+        mean(gR(leftIdx).^2) + ...      % R should be small near 400 nm
+        mean(gG(leftIdx).^2) + ...      % G should be small near 400 nm
+        mean(gG(rightIdx).^2) + ...     % G should be small near 700 nm
+        mean(gB(rightIdx).^2);          % B should be small near 700 nm
 
-    E_RGB = eta_R_low + eta_G_low + eta_G_high + eta_B_high;
-    rho_RGB = E_RGB / (1 + E_RGB);
-
+    edgeRGB = edgeRGB / (1 + edgeRGB);
     lambda_rgb_edge = 1e-3;
-    R_rgb_edge = lambda_rgb_edge * rho_RGB;
 
-    S = core + R_temp + R_rgb_edge;
+    R_rgb_edge = lambda_rgb_edge * edgeRGB;
+
+    S = core + R_temp+R_rgb_edge;  % + R_color 等你需要的项+ R_ortho_smooth
 end
 
 % function S = local_cost_with_fixed_c_reg(p_all, P, cH, cE, g5, lambda_ortho, lambda_s)
@@ -1391,6 +1393,7 @@ function [r, J] = pix_residual_aug_with_jac(x, Pj, gH, gE, Gmat, den, rho, v, ta
 
 % 与你原来的 pix_residual_with_jac 相同，但把 ADMM 二次项拼进去
 
+    ln10 = log(10);
     den  = max(den, 1e-12);
 
     S  = gH*x(1) + gE*x(2);      % 300x1
@@ -1402,8 +1405,8 @@ function [r, J] = pix_residual_aug_with_jac(x, Pj, gH, gE, Gmat, den, rho, v, ta
 
     SH = Gmat.' * (gH .* Y);     % 3x1
     SE = Gmat.' * (gE .* Y);     % 3x1
-    JH = SH ./ T;
-    JE = SE ./ T;
+    JH = (1/ln10) * (SH ./ T);
+    JE = (1/ln10) * (SE ./ T);
     J_data = [JH, JE];           % 3x2
 
     % ADMM 二次罚项
@@ -1438,25 +1441,79 @@ function [c,ceq] = nonlcon_identity_rgb_peak(p_all)
     ceq=[];
 end
 function [c, ceq] = nonlcon_physical_HE_relation(p_all)
-% H/E label-identification constraint: lambda_bar(E) <= lambda_bar(H).
+% 物理约束（不等式）：c(x) <= 0
+% 1) H(蓝) 与 E(红) 的光谱质心顺序:  centH + margin_nm <= centE
+% 2) E 的 G 段面积 >> R 段面积:       areaR_E - gamma_RG*areaG_E <= 0
+% 3) E 的 B 段不能过小:               beta_BG*areaG_E - areaB_E   <= 0
+% 4) [可选] 参数域 μ 顺序（加一道保险）: median(muH)+margin_nm <= median(muE)
+%
+% 说明：
+% - 高斯幅值/宽度/峰位的范围约束请用 fmincon 的 lb/ub。
+% - 这里的分段索引基于 400:1:700 nm（长度≈301）；若你的 g5 不是这网格，请相应改 wl_axis 与段范围。
 
+    % ---- 基本设置 ----
     idxBlk = @(k) (15*(k-1)+1):(15*k);
+    Aidx   = [1 4 7 10 13];
+    muidx  = [2 5 8 11 14];
+    sidx   = [3 6 9 12 15]; %#ok<NASGU>
+
     g5 = @(p) Gaussian_reconstruction5(p);
 
     pH = p_all(idxBlk(1));
     pE = p_all(idxBlk(2));
 
-    gH = g5(pH); gH = gH(:);
-    gE = g5(pE); gE = gE(:);
+    % 光谱（列向量）
+    gH = g5(pH); gE = g5(pE);
+    if isrow(gH), gH=gH'; end
+    if isrow(gE), gE=gE'; end
 
     L = numel(gH);
-    lambda_axis = linspace(400, 700, L)';
+    % 假设 g5 对应 400:1:700（301点）；若不是，请改这里
+    wl_axis = linspace(1,300,L)';          % nm
+    % 分段（索引）：B:[1,100], G:[101,200], R:[201,300]（按 400:700, 1nm）
+    % 若 L≠301，可按比例映射
+    seg = @(a,b) round( (a-1)/(700-400)*(L-1) ) + 1 : round( (b-1)/(700-400)*(L-1) ) + 1;
+    Bband = seg(1,100);
+    Gband = seg(101,200);
+    Rband = seg(201,300);
 
-    centH = sum(lambda_axis .* gH.^2) / (sum(gH.^2) + 1e-12);
-    centE = sum(lambda_axis .* gE.^2) / (sum(gE.^2) + 1e-12);
+    % ================= 1) 质心顺序（波长域） =================
+    % 注: 我们建模的是吸收光谱, 因此 H(蓝染) 的吸收峰在红区(右),
+%     E(红染) 的吸收峰在绿区(左), 故应满足 centE < centH。
 
-    % fmincon uses c <= 0.
-    c = centE - centH;
+    w  = wl_axis;
+    centH = (w'*(gH.^2)) / (sum(gH.^2) + 1e-12);
+    centE = (w'*(gE.^2)) / (sum(gE.^2) + 1e-12);
+
+    margin_nm = 0;  % 至少 20 nm 的间隔
+    c_centroid = (centE + margin_nm) - centH;    % <= 0
+
+    % ================= 2/3) E 的分段面积关系 =================
+    areaB_E = sum(gE(Bband));
+    areaG_E = sum(gE(Gband));
+    areaR_E = sum(gE(Rband));
+
+    % “G 段优势”约束：R 不应超过 G 的某个比例
+    gamma_RG = 0.3;                 % 允许 R 至多为 G 的 70%
+    c_E_green_dom = areaR_E - gamma_RG*areaG_E;  % <= 0  （若 R>0.7G 则违反）
+
+    % % “蓝不能太低”约束：B 至少为 G 的某个比例，避免偏黄
+    % beta_BG = 0.25;                 % B 至少为 G 的 25%
+    % c_E_blue_floor = beta_BG*areaG_E - areaB_E;  % <= 0  （若 B<0.25G 则违反）
+
+    % % ================= 4) [可选] 参数域 μ 顺序（更强保险） =================
+    % % 注意：若你在 lb/ub 已经把 H 的 μ 限到低波段、E 的 μ 限到高波段，此项可留空。
+    % muH = pH(muidx);
+    % muE = pE(muidx);
+    %
+    % % 如果 μ 是索引（1..L），把它映射到 nm；如果已经是 nm，注释掉映射行。
+    % muH_nm = map_mu_to_nm(muH, w, L);
+    % muE_nm = map_mu_to_nm(muE, w, L);
+    %
+    % c_mu_order = (median(muH_nm) + margin_nm) - median(muE_nm); % <= 0
+
+    % 组装
+    c   = [c_centroid; c_E_green_dom];
     ceq = [];
 end
 
@@ -1781,6 +1838,7 @@ function [r, J] = pix_residual_L2_with_jac(x, Pj, gH, gE, Gmat, den, lambda2)
 % ------------------------------------------------------------
 
     % ===== 数据项（和你原来的 pix_residual_with_jac 相同）=====
+    ln10 = log(10);
     den  = max(den, 1e-12);
 
     S  = gH*x(1) + gE*x(2);      % 300×1
@@ -1793,8 +1851,8 @@ function [r, J] = pix_residual_L2_with_jac(x, Pj, gH, gE, Gmat, den, lambda2)
 
     SH = Gmat.' * (gH .* Y);     % 3×1
     SE = Gmat.' * (gE .* Y);     % 3×1
-    JH = SH ./ T;
-    JE = SE ./ T;
+    JH = (1/ln10) * (SH ./ T);
+    JE = (1/ln10) * (SE ./ T);
     J_data = [JH, JE];           % 3×2
 
     % ===== L2 正则项 =====
@@ -1995,13 +2053,11 @@ function [p_cur, cH, cE, cH_hist, cE_hist] = normalize_HE_RGB_state( ...
         cE_hist = cE_hist * sE;
     end
 
-    rgb_profiles = {gR_tmp(:), gG_tmp(:), gB_tmp(:)};
-    for cc = 1:3
-        gC = rgb_profiles{cc};
-        kappaC = max(gC);
-        if kappaC > 1e-9
-            bC = idxBlk(cc + 2);   % blocks 3,4,5 -> R,G,B
-            p_cur(bC(Aidx)) = p_cur(bC(Aidx)) / kappaC;
+    s_RGB = max([max(gR_tmp), max(gG_tmp), max(gB_tmp)]);
+    if s_RGB > 1e-9
+        for kk = 3:5
+            bi = idxBlk(kk);
+            p_cur(bi(Aidx)) = p_cur(bi(Aidx)) / s_RGB;
         end
     end
 end
@@ -2056,6 +2112,7 @@ end
 function [r, J] = pix_residual_history_with_jac(x, Pj, ...
                                                 gH, gE, Gmat, den, ...
                                                 alpha_hist, c_hist, sigma_od)
+    ln10 = log(10);
     den = max(den, 1e-12);
 
     S = gH*x(1) + gE*x(2);
@@ -2067,7 +2124,7 @@ function [r, J] = pix_residual_history_with_jac(x, Pj, ...
 
     SH = Gmat.' * (gH .* Y);
     SE = Gmat.' * (gE .* Y);
-    J_data = [SH ./ T, SE ./ T] ./ max(sigma_od, 1e-2);
+    J_data = [(1/ln10) * (SH ./ T), (1/ln10) * (SE ./ T)] ./ max(sigma_od, 1e-2);
 
     s_hist = sqrt(alpha_hist);
     r_hist = s_hist * (x - c_hist);
@@ -2277,7 +2334,7 @@ function S = local_cost_with_fast_C_refit(p_all, P, cH_base, cE_base, g5, ...
 end
 function [c, ceq] = nonlcon_physical_HE_RGB_relation(p_all)
 
-    [c_he, ~] = nonlcon_physical_HE_relation(p_all);
+    [c_he, ceq] = nonlcon_physical_HE_relation(p_all);
 
     idxBlk = @(k) (15*(k-1)+1):(15*k);
     g5 = @(p) Gaussian_reconstruction5(p);
@@ -2291,20 +2348,18 @@ function [c, ceq] = nonlcon_physical_HE_RGB_relation(p_all)
     gB = g5(pB); gB = gB(:);
 
     L = numel(gR);
-    lambda_axis = linspace(400, 700, L)';
+    w = (1:L)';
 
-    centR = sum(lambda_axis .* gR.^2) / (sum(gR.^2) + 1e-12);
-    centG = sum(lambda_axis .* gG.^2) / (sum(gG.^2) + 1e-12);
-    centB = sum(lambda_axis .* gB.^2) / (sum(gB.^2) + 1e-12);
+    centR = sum(w .* gR.^2) / (sum(gR.^2) + 1e-12);
+    centG = sum(w .* gG.^2) / (sum(gG.^2) + 1e-12);
+    centB = sum(w .* gB.^2) / (sum(gB.^2) + 1e-12);
 
-    delta_RGB = 10;  % minimum centroid separation [nm]
+    margin = 10;
 
-    % fmincon uses c <= 0: B + delta <= G, G + delta <= R.
     c_rgb_order = [
-        centB + delta_RGB - centG;
-        centG + delta_RGB - centR
+        centB + margin - centG;
+        centG + margin - centR
     ];
 
     c = [c_he; c_rgb_order];
-    ceq = [];
 end

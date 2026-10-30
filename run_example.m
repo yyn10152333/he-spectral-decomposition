@@ -14,6 +14,16 @@ end
 codeDir = fileparts(mfilename('fullpath'));
 oldDir = pwd;
 cleanup = onCleanup(@() cd(oldDir));
+% Resolve paths against the caller's directory before changing directories.
+[ok, refInfo] = fileattrib(refImagePath);
+assert(ok, 'Cannot resolve reference image path.');
+refImagePath = refInfo.Name;
+[ok, inputInfo] = fileattrib(inputDir);
+assert(ok, 'Cannot resolve input directory path.');
+inputDir = inputInfo.Name;
+if ~java.io.File(char(outRoot)).isAbsolute()
+    outRoot = fullfile(oldDir, outRoot);
+end
 cd(codeDir);
 addpath(codeDir, '-begin');
 

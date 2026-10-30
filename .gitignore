@@ -1,0 +1,6 @@
+# MATLAB autosaves and local reference cache
+*.asv
+*.m~
+/ref/
+/output/
+/outputs/
